@@ -140,41 +140,82 @@ class GmmFunction(torch.autograd.Function):
         return dx, dw, None, None  
 
 
-def moe_block_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-    # hidden_states: (batch_size, sequence_length, hidden_size)
-    hidden_dim = hidden_states.shape[-1]
-    hidden_states = hidden_states.view(-1, hidden_dim)
-    # router_logits: (batch * sequence_length, n_experts)
-    router_logits = self.gate(hidden_states)
+class NPUQwen3MoeExperts(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.num_experts = config.num_experts
+        self.hidden_size = config.hidden_size
+        self.intermediate_size = config.moe_intermediate_size
+        self.gate_proj = nn.Parameter(
+            torch.empty(self.num_experts, self.intermediate_size, self.hidden_size)
+        )
+        self.up_proj = nn.Parameter(
+            torch.empty(self.num_experts, self.intermediate_size, self.hidden_size)
+        )
+        self.down_proj = nn.Parameter(
+            torch.empty(self.num_experts, self.hidden_size, self.intermediate_size)
+        )
+        self.act_fn = ACT2FN[config.hidden_act]
 
-    routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
-    routing_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
-    if self.norm_topk_prob:  # only diff with mixtral sparse moe block!
-        routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
-    # we cast back to the input dtype
-    routing_weights = routing_weights.to(hidden_states.dtype)
+    def forward(
+        self, hidden_states: torch.Tensor, routing_weights: torch.Tensor, router_indices: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        When training it is more efficient to just loop over the experts and compute the output for each expert
+        as otherwise the memory would explode.
 
-    # Loop over all available experts in the model and perform the computation on each expert
-    # Concat all weights
-    input_dtype = hidden_states.dtype
-    up_weight_list = [e.up_proj.weight for e in self.experts]
-    gate_weight_list = [e.gate_proj.weight for e in self.experts]
-    down_weight_list = [e.down_proj.weight for e in self.experts]
-    w1 = torch.stack(up_weight_list).transpose(1, 2).to(input_dtype) 
-    w2 = torch.stack(gate_weight_list).transpose(1, 2).to(input_dtype) 
-    w3 = torch.stack(down_weight_list).transpose(1, 2).to(input_dtype) 
+        Args:
+            hidden_states (torch.Tensor): (batch_size * sequence_length, hidden_size)
+            routing_weights (torch.Tensor): (batch_size * sequence_length, num_experts)
+            router_indices (torch.Tensor): (batch_size * sequence_length, top_k)
+        Returns:
+            torch.Tensor
+        """
+        hidden_states = hidden_states.reshape(-1, self.hidden_size)
+        
+        permuted_tokens, row_ids_map = torch_npu.npu_moe_token_permute(hidden_states, router_indices.to(torch.int32))
+        tokens_per_expert = torch.histc(router_indices, bins=self.num_experts, min=0, max=self.num_experts)
 
-    permuted_tokens, row_ids_map = torch_npu.npu_moe_token_permute(hidden_states, selected_experts.to(torch.int32))
-    tokens_per_expert = torch.histc(selected_experts, bins=self.num_experts, min=0, max=self.num_experts)
+        up_res = GmmFunction.apply(permuted_tokens, self.up_proj.transpose(1, 2), tokens_per_expert)
+        gate_res = GmmFunction.apply(permuted_tokens, self.gate_proj.transpose(1, 2), tokens_per_expert)
+        act_res = torch_npu.npu_swiglu(torch.cat([gate_res, up_res], dim=-1))
+        down_res = GmmFunction.apply(act_res, self.down_proj.transpose(1, 2), tokens_per_expert)
 
-    up_res = GmmFunction.apply(permuted_tokens, w1, tokens_per_expert)
-    gate_res = GmmFunction.apply(permuted_tokens, w2, tokens_per_expert)
-    act_res = torch_npu.npu_swiglu(torch.cat([gate_res, up_res], dim=-1))
-    down_res = GmmFunction.apply(act_res, w3, tokens_per_expert)
+        final_hidden_states = torch_npu.npu_moe_token_unpermute(down_res, row_ids_map, probs=routing_weights)
 
-    final_hidden_states = torch_npu.npu_moe_token_unpermute(down_res, row_ids_map, probs=routing_weights)
+        return final_hidden_states
 
-    return final_hidden_states, router_logits
+
+class NPUQwen3MoeSparseMoeBlock(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.num_experts = config.num_experts
+        self.top_k = config.num_experts_per_tok
+        self.norm_topk_prob = config.norm_topk_prob
+
+        self.gate = nn.Linear(config.hidden_size, config.num_experts, bias=False)
+        self.experts = NPUQwen3MoeExperts(config)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        batch_size, sequence_length, hidden_dim = hidden_states.shape
+        hidden_states = hidden_states.view(-1, hidden_dim)
+        # router_logits: (batch * sequence_length, n_experts)
+        router_logits = self.gate(hidden_states)
+
+        routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
+        routing_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
+        if self.norm_topk_prob:
+            routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
+            
+        # we cast back to the input dtype
+        routing_weights = routing_weights.to(hidden_states.dtype)
+
+        final_hidden_states = self.experts(
+            hidden_states, routing_weights=routing_weights, router_indices=selected_experts
+        )
+        
+        final_hidden_states = final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
+        return final_hidden_states, router_logits
 
 
 class NPUQwen3VLMoeTextExperts(nn.Module):
@@ -294,7 +335,7 @@ modeling_qwen2_5_vl.Qwen2RMSNorm.forward = rms_norm_forward
 modeling_qwen2_5_vl.Qwen2_5_VLMLP.forward = silu_forward
 modeling_qwen2_5_vl.apply_rotary_pos_emb_flashatt = apply_rotary_pos_emb_flashatt_npu
 modeling_qwen3_moe.Qwen3MoeRMSNorm.forward = rms_norm_forward
-modeling_qwen3_moe.Qwen3MoeSparseMoeBlock.forward = moe_block_forward
+modeling_qwen3_moe.Qwen3MoeSparseMoeBlock = NPUQwen3MoeSparseMoeBlock
 modeling_qwen3_moe.apply_rotary_pos_emb = apply_rotary_pos_emb_npu
 modeling_qwen3.Qwen3RMSNorm.forward = rms_norm_forward
 modeling_qwen3.Qwen3MLP.forward = silu_forward
