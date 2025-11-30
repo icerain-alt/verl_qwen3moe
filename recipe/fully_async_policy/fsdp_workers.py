@@ -90,7 +90,22 @@ class DetachNcclSync(AsyncActorRolloutRefWorker):
                     origin_data = origin_data.full_tensor()
                 if torch.distributed.get_rank() == 0:
                     tensor.copy_(origin_data)
+
             from ray.util.collective import collective
+
+            # For Qwen3MoE expert weights: split concatenated tensor into individual experts
+            if "mlp.experts" in key and len(shape) == 3:
+                splited_keys = key.split(".")
+                # Generate weight keys for each expert (e.g., mlp.experts.0.gate_proj.weight)
+                key_group = [".".join(splited_keys[:-1] + [f"{i}", splited_keys[-1], "weight"]) for i in range(shape[0])]
+                # Split concatenated tensor by expert dimension
+                tensor_group = [tensor[i] for i in range(shape[0])]
+
+                for k, t in zip(key_group, tensor_group):
+                    collective.broadcast(tensor, src_rank=0, group_name="actor_rollout")
+                    if self._is_rollout:
+                        inference_model.load_weights([(k, t)])
+                continue
 
             collective.broadcast(tensor, src_rank=0, group_name="actor_rollout")
             if self._is_rollout:
