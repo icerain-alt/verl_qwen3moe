@@ -92,24 +92,20 @@ class DetachNcclSync(AsyncActorRolloutRefWorker):
                     tensor.copy_(origin_data)
 
             from ray.util.collective import collective
-
-            # For Qwen3MoE expert weights: split concatenated tensor into individual experts
-            if "mlp.experts" in key and len(shape) == 3:
-                splited_keys = key.split(".")
-                # Generate weight keys for each expert (e.g., mlp.experts.0.gate_proj.weight)
-                key_group = [".".join(splited_keys[:-1] + [f"{i}", splited_keys[-1], "weight"]) for i in range(shape[0])]
-                # Split concatenated tensor by expert dimension
-                tensor_group = [tensor[i] for i in range(shape[0])]
-
-                for k, t in zip(key_group, tensor_group):
-                    collective.broadcast(tensor, src_rank=0, group_name="actor_rollout")
-                    if self._is_rollout:
-                        inference_model.load_weights([(k, t)])
-                continue
-
             collective.broadcast(tensor, src_rank=0, group_name="actor_rollout")
+
             if self._is_rollout:
-                inference_model.load_weights([(key, tensor)])
+                # For fused expert weights: split concatenated tensor into individual experts
+                if "mlp.experts" in key and len(shape) == 3:
+                    splited_keys = key.split(".")
+                    # Generate weight keys for each expert (e.g., mlp.experts.0.gate_proj.weight)
+                    key_group = [".".join(splited_keys[:-1] + [f"{i}", splited_keys[-1], "weight"]) for i in range(shape[0])]
+                    # Split concatenated tensor by expert dimension
+                    tensor_group = [tensor[i] for i in range(shape[0])]
+                    for k, t in zip(key_group, tensor_group):
+                        inference_model.load_weights([(k, t)])
+                else:
+                    inference_model.load_weights([(key, tensor)])
 
         if self._is_actor and self._is_offload_param:
             offload_fsdp_model_to_cpu(self.actor_module_fsdp)
